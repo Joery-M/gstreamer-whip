@@ -1,6 +1,8 @@
 Simple WHIP Client
 ==================
 
+based on [simple-whip-client](https://github.com/meetecho/simple-whip-client) but updated to libsoup-3.0.
+
 This is a prototype implementation of a [WHIP client](https://www.ietf.org/archive/id/draft-ietf-wish-whip-01.html), developed by [Meetecho](https://www.meetecho.com). While it was initially conceived to be used mostly for testing with [Simple WHIP Server](https://github.com/meetecho/simple-whip-server) (based on [Janus](https://github.com/meetecho/janus-gateway/)), as a standard WHIP implementation it's supposed to interoperate just as well with other WHIP implementations (check [this presentation](https://github.com/IETF-Hackathon/ietf112-project-presentations/blob/main/ietf112-hackathon-whip.pdf) for some interoperability considerations).
 
 # Building the WHIP client
@@ -9,7 +11,7 @@ The main dependencies of this client are:
 
 * [pkg-config](http://www.freedesktop.org/wiki/Software/pkg-config/)
 * [GLib](http://library.gnome.org/devel/glib/)
-* [libsoup](https://wiki.gnome.org/Projects/libsoup) (~= 2.4)
+* [libsoup](https://wiki.gnome.org/Projects/libsoup) (~= 3.0)
 * [GStreamer](https://gstreamer.freedesktop.org/) (>= 1.16)
 
 Make sure the related development versions of the libraries are installed, before attempting to build the client, as to keep things simple the `Makefile` is actually very raw and naive: it makes use of `pkg-config` to detect where the libraries are installed, but if some are not available it will still try to proceed (and will fail with possibly misleading error messages). All of the libraries should be available in most repos (they definitely are on Fedora, which is what I use everyday, and to my knowledge Ubuntu as well).

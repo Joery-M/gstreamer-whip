@@ -1,0 +1,22 @@
+{
+    "files.associations": {
+        "gst.h": "c",
+        "sdp.h": "c",
+        "type_traits": "c",
+        "webrtc.h": "c",
+        "bit": "cpp",
+        "cmath": "cpp",
+        "compare": "cpp",
+        "concepts": "cpp",
+        "cstdarg": "cpp",
+        "cstdio": "cpp",
+        "cstdlib": "cpp",
+        "limits": "cpp",
+        "new": "cpp",
+        "*.tcc": "cpp",
+        "cinttypes": "cpp",
+        "cstdint": "cpp",
+        "typeinfo": "cpp",
+        "future": "cpp"
+    }
+}

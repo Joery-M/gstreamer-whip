@@ -22,7 +22,8 @@
 #include <gst/webrtc/webrtc.h>
 
 /* HTTP stack (WHIP API) */
-#include <libsoup/soup.h>
+#include <libsoup-3.0/libsoup/soup.h>
+#include <libsoup-3.0/libsoup/soup-types.h>
 
 /* Local includes */
 #include "debug.h"
@@ -57,7 +58,7 @@ static char *auto_stun_server = NULL, **auto_turn_server = NULL;
 static int latency = -1;
 
 /* API properties */
-static enum whip_state state = 0;
+static enum whip_state state = WHIP_STATE_DISCONNECTED;
 static const char *server_url = NULL, *token = NULL, *eos_sink_name = NULL;
 static char *resource_url = NULL, *latest_etag = NULL;;
 
@@ -97,7 +98,10 @@ typedef struct whip_http_session {
 	char *redirect_url;
 	/* Number of redirects happened so far */
 	guint redirects;
+	/* Body of the last libsoup HTTP message */
+	GBytes* body_data;
 } whip_http_session;
+
 /* Helper method to send HTTP messages */
 static guint whip_http_send(whip_http_session *session, char *method,
 	char *url, char *payload, char *content_type);
@@ -107,7 +111,9 @@ static guint whip_http_send(whip_http_session *session, char *method,
 static volatile gint stop = 0, disconnected = 0;
 static void whip_handle_signal(int signum) {
 	WHIP_LOG(LOG_INFO, "Stopping the WHIP client...\n");
-	if(g_atomic_int_compare_and_exchange(&stop, 0, 1)) {
+	if(g_atomic_int_get(&stop) == 0)
+	{
+		g_atomic_int_set(&stop, 1);
 		whip_disconnect("Shutting down");
 	} else {
 		g_atomic_int_inc(&stop);
@@ -309,13 +315,13 @@ static void whip_options(void) {
 	guint status = whip_http_send(&session, "OPTIONS", (char *)server_url, NULL, NULL);
 	if(status != 200 && status != 204) {
 		/* Didn't get the success we were expecting */
-		WHIP_LOG(LOG_WARN, " [%u] %s\n\n", status, status ? session.msg->reason_phrase : "HTTP error");
+		WHIP_LOG(LOG_WARN, " [%u] %s\n\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
 		g_object_unref(session.msg);
 		g_object_unref(session.http_conn);
 		return;
 	}
 	/* Check if there's Link headers with STUN/TURN servers we can use */
-	const char *link = soup_message_headers_get_list(session.msg->response_headers, "link");
+	const char *link = soup_message_headers_get_list(soup_message_get_response_headers(session.msg), "link");
 	if(link == NULL) {
 		WHIP_LOG(LOG_WARN, "No Link headers in OPTIONS response\n");
 	} else {
@@ -373,7 +379,14 @@ static gboolean whip_initialize(void) {
 	if(error) {
 		WHIP_LOG(LOG_ERR, "Failed to parse/launch the pipeline: %s\n", error->message);
 		g_error_free(error);
-		goto err;
+
+		// Basically just err, but without a syntax error
+		if(pipeline)
+			g_clear_object(&pipeline);
+		if(pc)
+			pc = NULL;
+		return FALSE;
+		// goto err;
 	}
 
 	if(eos_sink_name != NULL) {
@@ -533,7 +546,7 @@ static gboolean whip_send_candidates(gpointer user_data) {
 		g_strlcat(fragment, "\r\n", sizeof(fragment));
 	}
 	char *candidate = NULL;
-	while((candidate = g_async_queue_try_pop(candidates)) != NULL) {
+	while((candidate = (char*)g_async_queue_try_pop(candidates)) != NULL) {
 		WHIP_PREFIX(LOG_VERB, "Sending candidates: %s\n", candidate);
 		g_strlcat(fragment, "a=", sizeof(fragment));
 		g_strlcat(fragment, candidate, sizeof(fragment));
@@ -549,7 +562,7 @@ static gboolean whip_send_candidates(gpointer user_data) {
 	guint status = whip_http_send(&session, "PATCH", resource_url, fragment, "application/trickle-ice-sdpfrag");
 	if(status != 200 && status != 204) {
 		/* Couldn't trickle? */
-		WHIP_LOG(LOG_WARN, " [trickle] %u %s\n", status, status ? session.msg->reason_phrase : "HTTP error");
+		WHIP_LOG(LOG_WARN, " [trickle] %u %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
 	}
 	g_object_unref(session.msg);
 	g_object_unref(session.http_conn);
@@ -676,7 +689,7 @@ static void whip_connect(GstWebRTCSessionDescription *offer) {
 		attributes[0] = '\0';
 		expanded_sdp[0] = '\0';
 		char *candidate = NULL;
-		while((candidate = g_async_queue_try_pop(candidates)) != NULL) {
+		while((candidate = (char*)g_async_queue_try_pop(candidates)) != NULL) {
 			WHIP_PREFIX(LOG_VERB, "Adding candidate to SDP: %s\n", candidate);
 			g_strlcat(attributes, "a=", sizeof(attributes));
 			g_strlcat(attributes, candidate, sizeof(attributes));
@@ -723,17 +736,19 @@ static void whip_connect(GstWebRTCSessionDescription *offer) {
 	/* Create an HTTP connection */
 	whip_http_session session = { 0 };
 	guint status = whip_http_send(&session, "POST", (char *)server_url, sdp_offer, "application/sdp");
+	// WHIP_PREFIX(LOG_INFO, "Back %s\n", status);
 	g_free(sdp_offer);
+	
 	if(status != 201) {
 		/* Didn't get the success we were expecting */
-		WHIP_LOG(LOG_ERR, " [%u] %s\n", status, status ? session.msg->reason_phrase : "HTTP error");
+		WHIP_LOG(LOG_ERR, " [%u] %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
 		g_object_unref(session.msg);
 		g_object_unref(session.http_conn);
 		whip_disconnect("HTTP error");
 		return;
 	}
 	/* Get the response */
-	const char *content_type = soup_message_headers_get_content_type(session.msg->response_headers, NULL);
+	const char *content_type = soup_message_headers_get_content_type(soup_message_get_response_headers(session.msg), NULL);
 	if(content_type == NULL || strcasecmp(content_type, "application/sdp")) {
 		WHIP_LOG(LOG_ERR, "Unexpected content-type '%s'\n", content_type);
 		g_object_unref(session.msg);
@@ -741,7 +756,12 @@ static void whip_connect(GstWebRTCSessionDescription *offer) {
 		whip_disconnect("HTTP error");
 		return;
 	}
-	const char *answer = session.msg->response_body ? session.msg->response_body->data : NULL;
+
+	// Convert body to string
+	gsize size;
+    const guint8 *data = (guint8*)g_bytes_get_data(session.body_data, &size);
+    const char *answer = g_strndup((const gchar *)data, size);
+
 	if(answer == NULL || strstr(answer, "v=0\r\n") != answer) {
 		WHIP_LOG(LOG_ERR, "Missing or invalid SDP answer\n");
 		g_object_unref(session.msg);
@@ -750,14 +770,14 @@ static void whip_connect(GstWebRTCSessionDescription *offer) {
 		return;
 	}
 	/* Check if there's an ETag we should send in upcoming requests */
-	const char *etag = soup_message_headers_get_one(session.msg->response_headers, "etag");
+	const char *etag = soup_message_headers_get_one(soup_message_get_response_headers(session.msg), "etag");
 	if(etag == NULL) {
 		WHIP_LOG(LOG_WARN, "No ETag header, won't be able to set If-Match when trickling\n");
 	} else {
 		latest_etag = g_strdup(etag);
 	}
 	/* Parse the location header to populate the resource url */
-	const char *location = soup_message_headers_get_one(session.msg->response_headers, "location");
+	const char *location = soup_message_headers_get_one(soup_message_get_response_headers(session.msg), "location");
 	if(location == NULL) {
 		WHIP_LOG(LOG_WARN, "No Location header, won't be able to trickle or teardown the session\n");
 	} else {
@@ -766,14 +786,24 @@ static void whip_connect(GstWebRTCSessionDescription *offer) {
 			resource_url = g_strdup(location);
 		} else {
 			/* Relative path */
-			SoupURI *uri = soup_uri_new(server_url);
-			soup_uri_set_query(uri, NULL);
+			GUri *uri = g_uri_parse(server_url, (GUriFlags)0, NULL);
 			if(location[0] == '/') {
 				/* Use the full returned path as new path */
-				soup_uri_set_path(uri, location);
+				uri = g_uri_build(
+					(GUriFlags)0,
+					g_uri_get_scheme(uri),
+					g_uri_get_userinfo(uri),
+					g_uri_get_host(uri),
+					g_uri_get_port(uri),
+					location,
+					g_uri_get_query(uri),
+					g_uri_get_fragment(uri)
+				);
+
+				// gst_uri_set_path(uri, location);
 			} else {
 				/* Relative url, build the resource url accordingly */
-				const char *endpoint_path = soup_uri_get_path(uri);
+				const char *endpoint_path = g_uri_get_path(uri);
 				gchar **parts = g_strsplit(endpoint_path, "/", -1);
 				int i=0;
 				while(parts[i] != NULL) {
@@ -786,10 +816,22 @@ static void whip_connect(GstWebRTCSessionDescription *offer) {
 				}
 				char *resource_path = g_strjoinv("/", parts);
 				g_strfreev(parts);
-				soup_uri_set_path(uri, resource_path);
+
+				uri = g_uri_build(
+					(GUriFlags)0,
+					g_uri_get_scheme(uri),
+					g_uri_get_userinfo(uri),
+					g_uri_get_host(uri),
+					g_uri_get_port(uri),
+					resource_path,
+					g_uri_get_query(uri),
+					g_uri_get_fragment(uri)
+				);
+
+				// gst_uri_set_path(uri, resource_path);
 			}
-			resource_url = soup_uri_to_string(uri, FALSE);
-			soup_uri_free(uri);
+			resource_url = g_uri_to_string(uri);
+			// g_free(uri);
 		}
 		WHIP_PREFIX(LOG_INFO, "Resource URL: %s\n", resource_url);
 	}
@@ -863,8 +905,13 @@ static void whip_connect(GstWebRTCSessionDescription *offer) {
 
 /* Helper method to disconnect from the WHIP endpoint */
 static void whip_disconnect(char *reason) {
-	if(!g_atomic_int_compare_and_exchange(&disconnected, 0, 1))
+	if(g_atomic_int_get(&disconnected) == 0)
+	{
+		g_atomic_int_set(&disconnected, 1);
+	}else {
 		return;
+	}
+
 	WHIP_PREFIX(LOG_INFO, "Disconnecting from server (%s)\n", reason);
 	if(resource_url == NULL) {
 		/* FIXME Nothing to do? */
@@ -876,7 +923,7 @@ static void whip_disconnect(char *reason) {
 	whip_http_session session = { 0 };
 	guint status = whip_http_send(&session, "DELETE", resource_url, NULL, NULL);
 	if(status != 200) {
-		WHIP_LOG(LOG_WARN, " [%u] %s\n", status, status ? session.msg->reason_phrase : "HTTP error");
+		WHIP_LOG(LOG_WARN, " [%u] %s\n", status, status ? soup_message_get_reason_phrase(session.msg) : "HTTP error");
 	}
 	g_object_unref(session.msg);
 	g_object_unref(session.http_conn);
@@ -893,26 +940,53 @@ static guint whip_http_send(whip_http_session *session, char *method,
 		return 0;
 	}
 	/* Create an HTTP connection */
-	session->http_conn = soup_session_new_with_options(
-		SOUP_SESSION_SSL_STRICT, FALSE,
-		SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE, NULL
-	);
+	session->http_conn = soup_session_new();
 	session->msg = soup_message_new(method, session->redirect_url ? session->redirect_url : url);
 	soup_message_set_flags(session->msg, SOUP_MESSAGE_NO_REDIRECT);
 	if(payload != NULL && content_type != NULL)
-		soup_message_set_request(session->msg, content_type, SOUP_MEMORY_COPY, payload, strlen(payload));
+		soup_message_set_request_body_from_bytes(session->msg, content_type, g_string_free_to_bytes(g_string_new(payload)));
+	
 	if(token != NULL) {
 		/* Add an authorization header too */
 		char auth[1024];
 		g_snprintf(auth, sizeof(auth), "Bearer %s", token);
-		soup_message_headers_append(session->msg->request_headers, "Authorization", auth);
+		soup_message_headers_append(soup_message_get_request_headers(session->msg), "Authorization", auth);
 	}
 	if(latest_etag != NULL) {
 		/* Add an If-Match header too with the available ETag */
-		soup_message_headers_append(session->msg->request_headers, "If-Match", latest_etag);
+		soup_message_headers_append(soup_message_get_request_headers(session->msg), "If-Match", latest_etag);
 	}
 	/* Send the message synchronously */
-	guint status = soup_session_send_message(session->http_conn, session->msg);
+	WHIP_PREFIX(LOG_INFO, "Sending\n");
+
+	GError *error = NULL;
+	// GAsyncResult* asyncResult;
+	session->body_data = soup_session_send_and_read(
+		session->http_conn,
+		session->msg,
+		NULL,
+		&error
+	);
+
+	if (error) {
+        g_printerr("Failed to POST: %s\n", error->message);
+        g_error_free (error);
+        // g_object_unref (msg);
+        // g_object_unref (session);
+        return 0;
+    }
+
+	guint status = soup_message_get_status (session->msg);
+	WHIP_PREFIX(LOG_INFO, "Sending2\n");
+	// WHIP_LOG(LOG_ERR, "%s\n", status);
+	if(error != NULL)
+	{
+		// WHIP_LOG(LOG_ERR, "%s\n", error->message);
+    	// g_clear_error (&error);
+		// return 0;
+	}
+
+	WHIP_PREFIX(LOG_INFO, "Sent\n");
 	if(status == 301 || status == 307) {
 		/* Redirected? Let's try again */
 		session->redirects++;
@@ -922,17 +996,25 @@ static guint whip_http_send(whip_http_session *session, char *method,
 			return 0;
 		}
 		g_free(session->redirect_url);
-		const char *location = soup_message_headers_get_one(session->msg->response_headers, "location");
+		const char *location = soup_message_headers_get_one(soup_message_get_request_headers(session->msg), "location");
 		if(strstr(location, "http")) {
 			/* Easy enough */
 			session->redirect_url = g_strdup(location);
 		} else {
 			/* Relative path */
-			SoupURI *uri = soup_uri_new(server_url);
-			soup_uri_set_query(uri, NULL);
-			soup_uri_set_path(uri, location);
-			session->redirect_url = soup_uri_to_string(uri, FALSE);
-			soup_uri_free(uri);
+			GUri *uri = g_uri_parse(server_url, (GUriFlags)0, NULL);
+			uri = g_uri_build(
+				(GUriFlags)0,
+				g_uri_get_scheme(uri),
+				g_uri_get_userinfo(uri),
+				g_uri_get_host(uri),
+				g_uri_get_port(uri),
+				location,
+				g_uri_get_query(uri),
+				g_uri_get_fragment(uri)
+			);
+			session->redirect_url =  g_uri_to_string(uri);
+			g_free(uri);
 		}
 		WHIP_LOG(LOG_INFO, "  -- Redirected to %s\n", session->redirect_url);
 		g_object_unref(session->msg);
@@ -944,6 +1026,7 @@ static guint whip_http_send(whip_http_session *session, char *method,
 	session->redirect_url = NULL;
 	return status;
 }
+
 
 /* Helper method to parse SDP offers and extract stuff we need */
 static gboolean whip_parse_offer(char *sdp_offer) {
@@ -1134,13 +1217,13 @@ static void whip_process_link_header(char *link) {
 		g_free(credential);
 		/* Add to the list of TURN servers */
 		if(auto_turn_server == NULL) {
-			auto_turn_server = g_malloc0(2*sizeof(gpointer));
+			auto_turn_server = (char**)g_malloc0(2*sizeof(gpointer));
 			auto_turn_server[0] = g_strdup(address);
 		} else {
 			int count = 0;
 			while(auto_turn_server[count] != NULL)
 				count++;
-			auto_turn_server = g_realloc(auto_turn_server, (count+2)*sizeof(gpointer));
+			auto_turn_server = (char**)g_realloc(auto_turn_server, (count+2)*sizeof(gpointer));
 			auto_turn_server[count] = g_strdup(address);
 			auto_turn_server[count+1] = NULL;
 		}
